@@ -50,20 +50,22 @@ const MARKET_URL =
 
             });
 
-            return results.slice(0,30);
+            return results.slice(0,20);
 
         });
 
         const newListings = [];
 
-        for(const item of listings){
+        for (const item of listings) {
 
-            if(!seen.includes(item.id)){
-
-                newListings.push(item);
-                seen.push(item.id);
-
+            // Stop when we reach an already processed listing
+            if (seen.includes(item.id)) {
+                console.log("Reached previously processed listing. Stopping scan.");
+                break;
             }
+
+            newListings.push(item);
+            seen.unshift(item.id);   // store newest first
 
         }
 
@@ -87,9 +89,11 @@ const MARKET_URL =
 
     }
 
+   seen = seen.slice(0, 500);
+
     fs.writeFileSync(
         "seenListings.json",
-        JSON.stringify(seen,null,2)
+        JSON.stringify(seen, null, 2)
     );
 
     console.log("Next scan in 80 seconds\n");
