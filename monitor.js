@@ -63,12 +63,9 @@ while(true){
 
     for (const item of listings) {
 
-        if (seen.includes(item.id)) {
-            console.log("Reached known listing. Stopping scan.");
-            break;
+        if (!seen.includes(item.id)) {
+            newListings.push(item);
         }
-
-        newListings.push(item);
 
     }
 
