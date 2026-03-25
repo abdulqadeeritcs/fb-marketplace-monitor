@@ -6,6 +6,9 @@ const MARKET_URL =
   "https://www.facebook.com/marketplace/melbourne/vehicles?sortBy=creation_time_descend&exact=false&radius=160";
 
 const SCAN_INTERVAL = 30000; // 30 seconds
+const SCROLL_STEPS = 5;
+const SCROLL_STEP_PX = 900;
+const SCROLL_PAUSE_MS = 800;
 
 function escapeHtml(str = "") {
   return String(str)
@@ -58,6 +61,13 @@ function buildEmailBodies(newListings) {
   return { text, html };
 }
 
+async function loadMoreListings(page) {
+  for (let i = 0; i < SCROLL_STEPS; i += 1) {
+    await page.mouse.wheel(0, SCROLL_STEP_PX);
+    await page.waitForTimeout(SCROLL_PAUSE_MS);
+  }
+}
+
 (async () => {
   const context = await chromium.launchPersistentContext("./fb-profile", {
     headless: false,
@@ -86,16 +96,30 @@ function buildEmailBodies(newListings) {
     await page.reload({ waitUntil: "domcontentloaded" });
 
     await page.waitForTimeout(5000);
+    await loadMoreListings(page);
 
     const listings = await page.evaluate(() => {
       const results = [];
       const seenInScan = new Set();
+      let sponsoredSkipped = 0;
 
       document
         .querySelectorAll('a[href*="/marketplace/item"]')
         .forEach((el) => {
           const url = el.href;
           const match = url.match(/item\/(\d+)/);
+          const card = el.closest('[role="article"]') || el.parentElement;
+          const topCardText = (card?.innerText || "")
+            .split("\n")
+            .slice(0, 8)
+            .join(" ")
+            .toLowerCase();
+          const isSponsored = /\bsponsored\b/.test(topCardText);
+
+          if (isSponsored) {
+            sponsoredSkipped += 1;
+            return;
+          }
 
           if (match && !seenInScan.has(match[1])) {
             seenInScan.add(match[1]);
@@ -117,12 +141,20 @@ function buildEmailBodies(newListings) {
           }
         });
 
-      return results.slice(0, 20);
+      return {
+        listings: results.slice(0, 40),
+        sponsoredSkipped,
+      };
     });
+
+    const extractedListings = listings.listings;
+    if (listings.sponsoredSkipped > 0) {
+      console.log(`Skipped ${listings.sponsoredSkipped} sponsored entries`);
+    }
 
     const seenSet = new Set(seen);
     const newListings = [];
-    for (const item of listings) {
+    for (const item of extractedListings) {
       if (!seenSet.has(item.id)) {
         newListings.push(item);
       }
@@ -130,7 +162,7 @@ function buildEmailBodies(newListings) {
 
     if (firstRun) {
       console.log("Warm-up scan complete. No alerts sent.");
-      seen = listings.map((l) => l.id);
+      seen = extractedListings.map((l) => l.id);
       firstRun = false;
     } else {
       if (newListings.length > 0) {
