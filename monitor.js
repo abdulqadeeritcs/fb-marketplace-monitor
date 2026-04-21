@@ -6,6 +6,7 @@ const MARKET_URL =
   "https://www.facebook.com/marketplace/melbourne/vehicles?sortBy=creation_time_descend&exact=false&radius=160";
 
 const SCAN_INTERVAL = 30000; // 30 seconds
+const MAX_SCAN_RETRIES = 5;
 const SCROLL_STEPS = 5;
 const SCROLL_STEP_PX = 900;
 const SCROLL_PAUSE_MS = 800;
@@ -68,6 +69,69 @@ async function loadMoreListings(page) {
   }
 }
 
+async function refreshMarketplace(page) {
+  try {
+    await page.reload({ waitUntil: "domcontentloaded" });
+  } catch (error) {
+    console.warn("Reload failed, retrying with direct navigation...");
+    await page.goto(MARKET_URL, { waitUntil: "domcontentloaded" });
+  }
+
+  await page.waitForTimeout(5000);
+  await loadMoreListings(page);
+}
+
+async function scanMarketplace(page) {
+  await refreshMarketplace(page);
+
+  return page.evaluate(() => {
+    const results = [];
+    const seenInScan = new Set();
+    let sponsoredSkipped = 0;
+
+    document.querySelectorAll('a[href*="/marketplace/item"]').forEach((el) => {
+      const url = el.href;
+      const match = url.match(/item\/(\d+)/);
+      const card = el.closest('[role="article"]') || el.parentElement;
+      const topCardText = (card?.innerText || "")
+        .split("\n")
+        .slice(0, 8)
+        .join(" ")
+        .toLowerCase();
+      const isSponsored = /\bsponsored\b/.test(topCardText);
+
+      if (isSponsored) {
+        sponsoredSkipped += 1;
+        return;
+      }
+
+      if (match && !seenInScan.has(match[1])) {
+        seenInScan.add(match[1]);
+        const imageEl = el.querySelector("img");
+        const textBits = (el.innerText || "")
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const title = textBits[0] || "Untitled listing";
+        const priceLine = textBits.find((s) => /[$€£]|\d/.test(s));
+
+        results.push({
+          id: match[1],
+          title,
+          price: priceLine || "",
+          image: imageEl?.src || "",
+          url,
+        });
+      }
+    });
+
+    return {
+      listings: results.slice(0, 40),
+      sponsoredSkipped,
+    };
+  });
+}
+
 (async () => {
   const context = await chromium.launchPersistentContext("./fb-profile", {
     headless: false,
@@ -91,105 +155,83 @@ async function loadMoreListings(page) {
   }
 
   while (true) {
-    console.log("Scanning marketplace...");
+    let scanSucceeded = false;
 
-    await page.reload({ waitUntil: "domcontentloaded" });
-
-    await page.waitForTimeout(5000);
-    await loadMoreListings(page);
-
-    const listings = await page.evaluate(() => {
-      const results = [];
-      const seenInScan = new Set();
-      let sponsoredSkipped = 0;
-
-      document
-        .querySelectorAll('a[href*="/marketplace/item"]')
-        .forEach((el) => {
-          const url = el.href;
-          const match = url.match(/item\/(\d+)/);
-          const card = el.closest('[role="article"]') || el.parentElement;
-          const topCardText = (card?.innerText || "")
-            .split("\n")
-            .slice(0, 8)
-            .join(" ")
-            .toLowerCase();
-          const isSponsored = /\bsponsored\b/.test(topCardText);
-
-          if (isSponsored) {
-            sponsoredSkipped += 1;
-            return;
-          }
-
-          if (match && !seenInScan.has(match[1])) {
-            seenInScan.add(match[1]);
-            const imageEl = el.querySelector("img");
-            const textBits = (el.innerText || "")
-              .split("\n")
-              .map((s) => s.trim())
-              .filter(Boolean);
-            const title = textBits[0] || "Untitled listing";
-            const priceLine = textBits.find((s) => /[$€£]|\d/.test(s));
-
-            results.push({
-              id: match[1],
-              title,
-              price: priceLine || "",
-              image: imageEl?.src || "",
-              url,
-            });
-          }
-        });
-
-      return {
-        listings: results.slice(0, 40),
-        sponsoredSkipped,
-      };
-    });
-
-    const extractedListings = listings.listings;
-    if (listings.sponsoredSkipped > 0) {
-      console.log(`Skipped ${listings.sponsoredSkipped} sponsored entries`);
-    }
-
-    const seenSet = new Set(seen);
-    const newListings = [];
-    for (const item of extractedListings) {
-      if (!seenSet.has(item.id)) {
-        newListings.push(item);
-      }
-    }
-
-    if (firstRun) {
-      console.log("Warm-up scan complete. No alerts sent.");
-      seen = extractedListings.map((l) => l.id);
-      firstRun = false;
-    } else {
-      if (newListings.length > 0) {
-        console.log(`Found ${newListings.length} new vehicles`);
-
-        const orderedListings = [...newListings].reverse();
-        const { text, html } = buildEmailBodies(orderedListings);
-
-        await sendEmail(
-          `Marketplace Alert (${newListings.length})`,
-          text,
-          html,
+    for (let attempt = 1; attempt <= MAX_SCAN_RETRIES; attempt += 1) {
+      try {
+        console.log(
+          `Scanning marketplace... attempt ${attempt}/${MAX_SCAN_RETRIES}`,
         );
-      }
 
-      newListings.forEach((v) => {
-        // Remove any previous entry for this id
-        const idx = seen.indexOf(v.id);
-        if (idx !== -1) seen.splice(idx, 1);
-        seen.unshift(v.id);
-      });
+        const listings = await scanMarketplace(page);
+        const extractedListings = listings.listings;
+
+        if (listings.sponsoredSkipped > 0) {
+          console.log(`Skipped ${listings.sponsoredSkipped} sponsored entries`);
+        }
+
+        const seenSet = new Set(seen);
+        const newListings = [];
+        for (const item of extractedListings) {
+          if (!seenSet.has(item.id)) {
+            newListings.push(item);
+          }
+        }
+
+        if (firstRun) {
+          console.log("Warm-up scan complete. No alerts sent.");
+          seen = extractedListings.map((l) => l.id);
+          firstRun = false;
+        } else {
+          if (newListings.length > 0) {
+            console.log(`Found ${newListings.length} new vehicles`);
+
+            const orderedListings = [...newListings].reverse();
+            const { text, html } = buildEmailBodies(orderedListings);
+
+            await sendEmail(
+              `Marketplace Alert (${newListings.length})`,
+              text,
+              html,
+            );
+          }
+
+          newListings.forEach((v) => {
+            // Remove any previous entry for this id
+            const idx = seen.indexOf(v.id);
+            if (idx !== -1) seen.splice(idx, 1);
+            seen.unshift(v.id);
+          });
+        }
+
+        seen = seen.slice(0, 500);
+        fs.writeFileSync("seenListings.json", JSON.stringify(seen, null, 2));
+
+        console.log("Next scan in 30 seconds\n");
+        scanSucceeded = true;
+        break;
+      } catch (error) {
+        console.warn(
+          `Scan attempt ${attempt}/${MAX_SCAN_RETRIES} failed: ${error.message}`,
+        );
+
+        if (attempt < MAX_SCAN_RETRIES) {
+          console.log("Refreshing page and retrying...");
+          try {
+            await page.goto(MARKET_URL, { waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(5000);
+          } catch (retryError) {
+            console.warn(`Retry refresh failed: ${retryError.message}`);
+          }
+        }
+      }
     }
 
-    seen = seen.slice(0, 500);
-    fs.writeFileSync("seenListings.json", JSON.stringify(seen, null, 2));
-
-    console.log("Next scan in 30 seconds\n");
+    if (!scanSucceeded) {
+      console.error(`Scan failed ${MAX_SCAN_RETRIES} times. Closing monitor.`);
+      await context.close();
+      process.exit(1);
+    }
 
     await page.waitForTimeout(SCAN_INTERVAL);
   }
